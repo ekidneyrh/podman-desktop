@@ -51,7 +51,7 @@ import type {
 import type { ContainerInspectInfo } from './api/container-inspect-info.js';
 import type { ContainerStatsInfo } from './api/container-stats-info.js';
 import type { HistoryInfo } from './api/history-info.js';
-import type { BuildImageOptions, ImageInfo, ListImagesOptions } from './api/image-info.js';
+import type { BuildImageOptions, ImageInfo, ListImagesOptions, PodmanListImagesOptions } from './api/image-info.js';
 import type { ImageInspectInfo } from './api/image-inspect-info.js';
 import type { ManifestCreateOptions } from './api/manifest-info.js';
 import type { NetworkInspectInfo } from './api/network-info.js';
@@ -59,6 +59,7 @@ import type { PodCreateOptions, PodInfo, PodInspectInfo } from './api/pod-info.j
 import type { ProviderContainerConnectionInfo } from './api/provider-info.js';
 import type { PullEvent } from './api/pull-event.js';
 import type { VolumeInfo, VolumeInspectInfo, VolumeListInfo } from './api/volume-info.js';
+import type { ConfigurationRegistry } from './configuration-registry.js';
 import type {
   ContainerCreateMountOption,
   ContainerCreateNetNSOption,
@@ -73,8 +74,10 @@ import { EnvfileParser } from './env-file-parser.js';
 import type { Event } from './events/emitter.js';
 import { Emitter } from './events/emitter.js';
 import type { ImageRegistry } from './image-registry.js';
+import { LibpodApiSettings } from './libpod-api-enable/libpod-api-settings.js';
 import type { Telemetry } from './telemetry/telemetry.js';
 import { Disposable } from './types/disposable.js';
+import { guessIsManifest } from './util/manifest.js';
 
 const tar: { pack: (dir: string) => NodeJS.ReadableStream } = require('tar-fs');
 
@@ -110,6 +113,7 @@ export class ContainerProviderRegistry {
 
   constructor(
     private apiSender: ApiSenderType,
+    private configurationRegistry: ConfigurationRegistry,
     private imageRegistry: ImageRegistry,
     private telemetryService: Telemetry,
   ) {
@@ -126,6 +130,12 @@ export class ContainerProviderRegistry {
   // map of streams per container id
   protected streamsPerContainerId: Map<string, NodeJS.ReadWriteStream> = new Map();
   protected streamsOutputPerContainerId: Map<string, Buffer[]> = new Map();
+
+  useLibpodApiForImageList(): boolean {
+    return this.configurationRegistry
+      .getConfiguration(LibpodApiSettings.SectionName)
+      .get<boolean>(LibpodApiSettings.ForImageList, false);
+  }
 
   handleEvents(api: Dockerode, errorCallback: (error: Error) => void): void {
     let nbEvents = 0;
@@ -584,6 +594,59 @@ export class ContainerProviderRegistry {
     );
     const flattenedImages = images.flat();
     this.telemetryService.track('listImages', Object.assign({ total: flattenedImages.length }, telemetryOptions));
+
+    return flattenedImages;
+  }
+
+  // Podman list images will prefer to use libpod API of the provider
+  // before falling back to using the regular API
+  async podmanListImages(options?: PodmanListImagesOptions): Promise<ImageInfo[]> {
+    const telemetryOptions = {};
+
+    // This gets all the available providers if no provider has been specified
+    let providers: InternalContainerProvider[];
+    if (options?.provider === undefined) {
+      providers = Array.from(this.internalProviders.values());
+    } else {
+      providers = [this.getMatchingContainerProvider(options?.provider)];
+    }
+
+    const images = await Promise.all(
+      providers.map(async provider => {
+        // Initialize an empty array for the case where neither API is available
+        // ignore any warning as we are adding engineId and engineName to the image
+        // and as one of the API uses Dockerode, the other ImageInfo
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let fetchedImages: any[] = [];
+
+        // If libpod API is available AND the configuration is set to use libpodApi, use podmanListImages API call.
+        if (provider.libpodApi && this.useLibpodApiForImageList()) {
+          fetchedImages = await provider.libpodApi.podmanListImages({
+            all: options?.all,
+            filters: options?.filters,
+          });
+        } else if (provider.api) {
+          fetchedImages = await provider.api.listImages({ all: false });
+        } else {
+          console.log('Engine does not have an API or a libpod API, returning empty array', provider.name);
+          return fetchedImages;
+        }
+
+        // Transform fetched images to include engine name and ID
+        return fetchedImages.map(image => ({
+          ...image,
+          engineName: provider.name,
+          engineId: provider.id,
+          // Using guessIsManifest, determine if the image is a manifest and set isManifest accordingly
+          // NOTE: This is a workaround until we have a better way to determine if an image is a manifest
+          // and may result in false positives until issue: https://github.com/containers/podman/issues/22184 is resolved
+          isManifest: guessIsManifest(image, provider.connection.type),
+        }));
+      }),
+    );
+
+    const flattenedImages = images.flat();
+    this.telemetryService.track('podmanListImages', Object.assign({ total: flattenedImages.length }, telemetryOptions));
 
     return flattenedImages;
   }

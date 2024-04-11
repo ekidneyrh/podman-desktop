@@ -23,24 +23,21 @@ import { Octokit } from 'octokit';
 import type { OctokitOptions } from '@octokit/core/dist-types/types';
 import { hashFile } from 'hasha';
 import { fileURLToPath } from 'node:url';
+import { Writable } from 'node:stream';
 
 // to make this file a module
 export class PodmanDownload {
   #podmanVersion: string;
 
-  #podmanDownloadFcosImage: PodmanDownloadFcosImage;
-  #podmanDownloadFedoraImage: PodmanDownloadFedoraImage;
+  #downloadAndCheck: DownloadAndCheck;
+  #podman5DownloadFedoraImage: Podman5DownloadFedoraImage;
+  #podman5DownloadMachineOS: Podman5DownloadMachineOS;
 
   #shaCheck: ShaCheck;
-
-  #httpsDownloader: HttpsDownloader;
 
   #octokit: Octokit;
   #platform: string;
   #assetsFolder: string;
-
-  readonly MAX_DOWNLOAD_ATTEMPT = 3;
-  #downloadAttempt = 0;
 
   #artifactsToDownload: {
     version: string;
@@ -107,43 +104,110 @@ export class PodmanDownload {
       }
     }
     this.#shaCheck = new ShaCheck();
-    this.#httpsDownloader = new HttpsDownloader();
-    this.#podmanDownloadFcosImage = new PodmanDownloadFcosImage(
-      this.#httpsDownloader,
-      this.#shaCheck,
-      this.#assetsFolder,
-    );
-    this.#podmanDownloadFedoraImage = new PodmanDownloadFedoraImage(
-      this.#octokit,
-      this.#httpsDownloader,
-      this.#assetsFolder,
-    );
 
+    this.#downloadAndCheck = new DownloadAndCheck(this.#octokit, this.#shaCheck, this.#assetsFolder);
     if (!fs.existsSync(this.#assetsFolder)) {
       fs.mkdirSync(this.#assetsFolder);
     }
+
+    // grab only first 2 digits from the version
+    const majorMinorVersion = podmanJSON.version.split('.').slice(0, 2).join('.');
+
+    this.#podman5DownloadFedoraImage = new Podman5DownloadFedoraImage(
+      majorMinorVersion,
+      this.#octokit,
+      this.#downloadAndCheck,
+    );
+
+    this.#podman5DownloadMachineOS = new Podman5DownloadMachineOS(
+      majorMinorVersion,
+      this.#shaCheck,
+      this.#assetsFolder,
+    );
   }
 
-  protected getPodmanDownloadFcosImage(): PodmanDownloadFcosImage {
-    return this.#podmanDownloadFcosImage;
+  protected getPodman5DownloadFedoraImage(): Podman5DownloadFedoraImage {
+    return this.#podman5DownloadFedoraImage;
   }
-  protected getPodmanDownloadFedoraImage(): PodmanDownloadFedoraImage {
-    return this.#podmanDownloadFedoraImage;
+
+  protected getPodman5DownloadMachineOS(): Podman5DownloadMachineOS {
+    return this.#podman5DownloadMachineOS;
   }
 
   protected getShaCheck(): ShaCheck {
     return this.#shaCheck;
   }
 
-  protected async downloadAndCheckSha(tagVersion: string, fileName: string, artifactName: string): Promise<void> {
+  protected getDownloadAndCheck(): DownloadAndCheck {
+    return this.#downloadAndCheck;
+  }
+
+  async downloadBinaries(): Promise<void> {
+    // fetch from GitHub releases
+    for (const artifact of this.#artifactsToDownload) {
+      await this.#downloadAndCheck.downloadAndCheckSha(artifact.version, artifact.downloadName, artifact.artifactName);
+    }
+
+    // fetch optional binaries in case of AirGap
+    await this.downloadAirGapBinaries();
+  }
+
+  protected async downloadAirGapBinaries(): Promise<void> {
+    if (!this.airgapSupport || !process.env.AIRGAP_DOWNLOAD) {
+      return;
+    }
+
+    if (this.#platform === 'win32') {
+      // download the fedora image
+
+      await this.#podman5DownloadFedoraImage?.download('x64');
+      await this.#podman5DownloadFedoraImage?.download('arm64');
+    } else if (this.#platform === 'darwin') {
+      // download the podman 5 machines OS
+      await this.#podman5DownloadMachineOS?.download();
+    }
+  }
+}
+
+export class ShaCheck {
+  async checkFile(filePath: string, shaSum: string): Promise<boolean> {
+    const sha256sum: string = await hashFile(filePath, { algorithm: 'sha256' });
+    return sha256sum === shaSum;
+  }
+}
+
+export class DownloadAndCheck {
+  readonly MAX_DOWNLOAD_ATTEMPT = 3;
+  #downloadAttempt = 0;
+  #octokit: Octokit;
+  #shaCheck: ShaCheck;
+  #assetsFolder: string;
+
+  constructor(
+    readonly octokit: Octokit,
+    readonly shaCheck: ShaCheck,
+    readonly assetsFolder: string,
+  ) {
+    this.#octokit = octokit;
+    this.#shaCheck = shaCheck;
+    this.#assetsFolder = assetsFolder;
+  }
+
+  public async downloadAndCheckSha(
+    tagVersion: string,
+    fileName: string,
+    artifactName: string,
+    owner: string = 'containers',
+    repo: string = 'podman',
+  ): Promise<void> {
     if (this.#downloadAttempt >= this.MAX_DOWNLOAD_ATTEMPT) {
       console.error('Max download attempt reached, exiting...');
       process.exit(1);
     }
 
     const release = await this.#octokit.request('GET /repos/{owner}/{repo}/releases/tags/{tag}', {
-      owner: 'containers',
-      repo: 'podman',
+      owner,
+      repo,
       tag: tagVersion,
     });
 
@@ -164,8 +228,8 @@ export class PodmanDownload {
 
     const shasumAsset = await this.#octokit.rest.repos.getReleaseAsset({
       asset_id: shasums.id,
-      owner: 'containers',
-      repo: 'podman',
+      owner,
+      repo,
       headers: {
         accept: 'application/octet-stream',
       },
@@ -188,240 +252,239 @@ export class PodmanDownload {
 
     const destFile = path.resolve(this.#assetsFolder, fileName);
     if (!fs.existsSync(destFile)) {
-      console.log(`Downloading Podman package from ${artifactRelease.browser_download_url}`);
+      console.log(`⚡️ Downloading artifact from ${artifactRelease.browser_download_url}`);
       // await downloadFile(url, destFile);
       const artifactAsset = await this.#octokit.rest.repos.getReleaseAsset({
         asset_id: artifactRelease.id,
-        owner: 'containers',
-        repo: 'podman',
+        owner,
+        repo,
         headers: {
           accept: 'application/octet-stream',
         },
       });
 
       fs.appendFileSync(destFile, Buffer.from(artifactAsset.data as unknown as ArrayBuffer));
-      console.log(`Downloaded to ${destFile}`);
+      console.log(`📔 Downloaded to ${destFile}`);
     } else {
-      console.log(`Podman package ${artifactRelease.browser_download_url} already downloaded.`);
+      console.log(`⏭️  Skipping ${artifactName} (already downloaded)`);
     }
-
-    console.log(`Verifying ${fileName}...`);
 
     if (!(await this.#shaCheck.checkFile(destFile, msiSha))) {
-      console.warn(`Checksum for downloaded ${destFile} is not match, downloading again...`);
+      console.warn(`❌ Invalid checksum for ${fileName} downloading again...`);
       fs.rmSync(destFile);
       this.#downloadAttempt++;
-      this.downloadAndCheckSha(tagVersion, fileName, artifactName);
+      await this.downloadAndCheckSha(tagVersion, fileName, artifactName);
     } else {
-      console.log(`Checksum for ${fileName} is matching.`);
-    }
-  }
-
-  async downloadBinaries(): Promise<void> {
-    // fetch from GitHub releases
-    for (const artifact of this.#artifactsToDownload) {
-      this.downloadAndCheckSha(artifact.version, artifact.downloadName, artifact.artifactName);
+      console.log(`✅ Valid checksum for ${fileName}`);
     }
 
-    // fetch optional binaries in case of AirGap
-    await this.downloadAirGapBinaries();
-  }
-
-  protected async downloadAirGapBinaries(): Promise<void> {
-    if (!this.airgapSupport || !process.env.AIRGAP_DOWNLOAD) {
-      return;
-    }
-
-    if (this.#platform === 'win32') {
-      // download the fedora image
-      this.#podmanDownloadFedoraImage.download('podman-wsl-fedora', 'x64');
-      this.#podmanDownloadFedoraImage.download('podman-wsl-fedora-arm', 'arm64');
-    } else if (this.#platform === 'darwin') {
-      // download the fedora core os images for both arches
-
-      await this.#podmanDownloadFcosImage.download('x64');
-      await this.#podmanDownloadFcosImage.download('arm64');
-    }
+    this.#downloadAttempt = 0;
   }
 }
 
-export class ShaCheck {
-  async checkFile(filePath: string, shaSum: string): Promise<boolean> {
-    const sha256sum: string = await hashFile(filePath, { algorithm: 'sha256' });
-    return sha256sum === shaSum;
-  }
-}
-
-export class HttpsDownloader {
-  // grab the JSON from the given URL
-  async downloadJson(url): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      https.get(url, res => {
-        let body = '';
-
-        res.on('data', chunk => {
-          body += chunk;
-        });
-
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(body);
-            resolve(json);
-          } catch (error) {
-            reject(error.message);
-          }
-        });
-
-        res.on('error', error => {
-          reject(error.message);
-        });
-      });
-    });
-  }
-
-  // download the file from the given URL and store the content in destFile
-  async downloadFile(url, destFile): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const request = https.get(url, async res => {
-        // handle url redirect
-        if (res.statusCode === 302) {
-          await this.downloadFile(res.headers.location, destFile);
-          resolve();
-        }
-
-        res.on('data', data => {
-          fs.appendFileSync(destFile, data);
-        });
-
-        res.on('end', () => {
-          try {
-            resolve();
-          } catch (error) {
-            reject(error.message);
-          }
-        });
-
-        res.on('error', error => {
-          reject(error.message);
-        });
-      });
-      request.end();
-    });
-  }
-}
-
-export class PodmanDownloadFcosImage {
-  #downloadAttempt = 0;
-  #httpsDownloader: HttpsDownloader;
-  #shaCheck: ShaCheck;
-  #assetsFolder: string;
-
+export class Podman5DownloadFedoraImage {
   readonly MAX_DOWNLOAD_ATTEMPT = 3;
+  #downloadAttempt = 0;
+  #octokit: Octokit;
+  #version: string;
+
+  #downloadAndCheck: DownloadAndCheck;
 
   constructor(
-    readonly httpsDownloader: HttpsDownloader,
-    readonly shaCheck: ShaCheck,
-    readonly assetsFolder: string,
+    readonly version: string,
+    readonly octokit: Octokit,
+    readonly downloadAndCheck: DownloadAndCheck,
   ) {
-    this.#httpsDownloader = httpsDownloader;
-    this.#shaCheck = shaCheck;
-    this.#assetsFolder = assetsFolder;
+    this.#version = version;
+    this.#octokit = octokit;
+    this.#downloadAndCheck = downloadAndCheck;
   }
 
-  // For macOS, grab the qemu image from Fedora CoreOS
+  // For Windows binaries, grab the latest release from GitHub repository
   async download(arch: string): Promise<void> {
     if (this.#downloadAttempt >= this.MAX_DOWNLOAD_ATTEMPT) {
       console.error('Max download attempt reached, exiting...');
       process.exit(1);
     }
 
-    // download the JSON of testing Fedora CoreOS images at https://builds.coreos.fedoraproject.org/streams/testing.json
-    const data = await this.#httpsDownloader.downloadJson(
-      'https://builds.coreos.fedoraproject.org/streams/testing.json',
-    );
-
-    // get the file to download
-    const qemuArch = arch === 'x64' ? 'x86_64' : 'aarch64';
-    const qemuData = data?.['architectures'][qemuArch]['artifacts']['qemu'];
-
-    // get disk object
-    const disk = qemuData.formats['qcow2.xz'].disk;
-
-    // get the disk location
-    const diskLocation = disk.location;
-
-    // get the sha2556
-    const sha256 = disk.sha256;
-
-    const filename = `podman-image-${arch}.qcow2.xz`;
-    const destFile = path.resolve(this.#assetsFolder, filename);
-    if (!fs.existsSync(destFile)) {
-      // download the file from diskLocation
-      console.log(`Downloading Podman package from ${diskLocation}`);
-      await this.httpsDownloader.downloadFile(diskLocation, destFile);
-      console.log(`Downloaded to ${destFile}`);
-    } else {
-      console.log(`Podman image ${filename} already downloaded.`);
-    }
-
-    if (!(await this.#shaCheck.checkFile(destFile, sha256))) {
-      console.warn(`Checksum for downloaded ${destFile} is not matching, downloading again...`);
-      fs.rmSync(destFile);
-      this.#downloadAttempt++;
-      // call the loop again
-      this.download(arch);
-    } else {
-      console.log(`Checksum for ${filename} matched.`);
-    }
-  }
-}
-
-export class PodmanDownloadFedoraImage {
-  readonly MAX_DOWNLOAD_ATTEMPT = 3;
-  #downloadAttempt = 0;
-  #octokit: Octokit;
-  #assetsFolder: string;
-
-  #httpsDownloader: HttpsDownloader;
-
-  constructor(
-    readonly octokit: Octokit,
-    readonly httpsDownloader: HttpsDownloader,
-    readonly assetsFolder: string,
-  ) {
-    this.#octokit = octokit;
-    this.#httpsDownloader = httpsDownloader;
-    this.#assetsFolder = assetsFolder;
-  }
-
-  // For Windows binaries, grab the latest release from GitHub repository
-  async download(repo: string, arch: string): Promise<void> {
-    if (this.#downloadAttempt >= this.MAX_DOWNLOAD_ATTEMPT) {
-      console.error('Max download attempt reached, exiting...');
-      process.exit(1);
-    }
+    const owner = 'containers';
+    const repo = 'podman-machine-wsl-os';
 
     // now, grab the files
     const release = await this.#octokit.request('GET /repos/{owner}/{repo}/releases/latest', {
-      owner: 'containers',
+      owner,
       repo,
     });
 
-    const artifactRelease = release.data.assets.find(asset => asset.name === 'rootfs.tar.xz');
+    let artifactArch;
+    if (arch === 'x64') {
+      artifactArch = 'amd64';
+    } else if (arch === 'arm64') {
+      artifactArch = 'arm64';
+    }
+
+    const artifactName = `${this.#version}-rootfs-${artifactArch}.tar.zst`;
+    const filename = `podman-image-${arch}.tar.zst`;
+    const artifactRelease = release.data.assets.find(asset => asset.name === artifactName);
 
     if (!artifactRelease) {
-      throw new Error(`Can't find assets to download and verify for podman image from repository ${repo}`);
+      throw new Error(
+        `Can't find asset with name ${artifactName} to download and verify for podman image from repository ${repo}`,
+      );
     }
 
-    const filename = `podman-image-${arch}.tar.xz`;
-    const destFile = path.resolve(this.#assetsFolder, filename);
-    if (!fs.existsSync(destFile)) {
-      // download the file from diskLocation
-      console.log(`Downloading Podman package from ${artifactRelease.browser_download_url}`);
-      await this.#httpsDownloader.downloadFile(artifactRelease.browser_download_url, destFile);
-      console.log(`Downloaded to ${destFile}`);
-    } else {
-      console.log(`Podman image ${filename} already downloaded.`);
+    // tag version
+    const tagVersion = release.data.tag_name;
+    await this.#downloadAndCheck.downloadAndCheckSha(tagVersion, filename, artifactName, owner, repo);
+  }
+}
+
+export class Podman5DownloadMachineOS {
+  #version: string;
+  #shaCheck: ShaCheck;
+  #assetsFolder: string;
+
+  constructor(
+    readonly version: string,
+    readonly shaCheck: ShaCheck,
+    readonly assetsFolder: string,
+  ) {
+    this.#version = version;
+    this.#shaCheck = shaCheck;
+    this.#assetsFolder = assetsFolder;
+  }
+
+  async getManifest(manifestUrl: string): Promise<any> {
+    const response = await fetch(manifestUrl, {
+      method: 'GET',
+      headers: {
+        'docker-distribution-api-version': 'registry/2.0',
+        Accept: 'application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json',
+      },
+    });
+    return response.json();
+  }
+
+  protected async pipe(
+    title: string,
+    total: number,
+    stream: ReadableStream<Uint8Array>,
+    writableStream: WritableStream<Uint8Array>,
+  ) {
+    let loaded = 0;
+
+    var progress = new TransformStream({
+      transform(chunk, controller) {
+        loaded += chunk.length;
+
+        // 20 chars = 100%
+        const i = Math.floor((loaded / total) * 20);
+        const dots = '.'.repeat(i);
+        const left = 20 - i;
+        const empty = ' '.repeat(left);
+
+        process.stdout.write(`\r⚡️ Downloading ${title} [${dots}${empty}] ${i * 5}%`);
+        controller.enqueue(chunk);
+      },
+    });
+
+    await stream.pipeThrough(progress).pipeTo(writableStream);
+  }
+
+  async downloadZstdFromManifest(
+    title: string,
+    filename: string,
+    layer: { digest: string; size: number },
+  ): Promise<void> {
+    const blobURL = `https://quay.io/v2/podman/machine-os/blobs/${layer.digest}`;
+
+    const blobResponse = await fetch(blobURL);
+    const total = layer.size;
+    const outputFile = path.resolve(this.#assetsFolder, filename);
+    // digest is using the format : sha256:checksum
+    // extract the checksum
+    const checksum = layer.digest.split(':')[1];
+
+    // check if the file exists and has the expected checksum
+    if (fs.existsSync(outputFile)) {
+      // check now the checksum
+      const valid = await this.#shaCheck.checkFile(outputFile, checksum);
+      if (valid) {
+        console.log(`⏭️  Skipping ${title} (already downloaded to ${filename})`);
+        return;
+      }
     }
+
+    const writer = fs.createWriteStream(outputFile);
+    const writableStream = Writable.toWeb(writer);
+
+    if (!blobResponse.body) {
+      throw new Error(`❌ Cannot get blob for ${title}`);
+    }
+
+    await this.pipe(title, total, blobResponse.body, writableStream);
+
+    process.stdout.write(`\r📔 ${title} downloaded to ${filename}\n`);
+
+    // verify the checksum
+    const valid = await this.#shaCheck.checkFile(outputFile, checksum);
+    if (valid) {
+      console.log(`✅ Valid checksum for ${filename}`);
+    } else {
+      throw new Error(`❌ Invalid checksum for ${filename}`);
+    }
+  }
+
+  // For macOS, need to grab images from quay.io/podman/machine-os repository
+  async download(): Promise<void> {
+    const manifestUrl = `https://quay.io/v2/podman/machine-os/manifests/${this.#version}`;
+
+    // get first level of manifests
+    const rootManifest = await this.getManifest(manifestUrl);
+
+    if (rootManifest.errors) {
+      console.error(`❌ Cannot get manifest for ${manifestUrl}`, rootManifest.errors);
+      throw new Error(`❌ Cannot get manifest for ${manifestUrl}`);
+    }
+
+    const manifests = rootManifest.manifests;
+
+    // grab applehv as annotations / disktype
+    const keepManifests = manifests.filter(manifest => {
+      const annotations = manifest.annotations;
+      return annotations && annotations.disktype === 'applehv';
+    });
+
+    // should have aarch64 for arm64 and x86_64 for x64
+    const amd64Manifest = keepManifests.find(
+      manifest => manifest.platform.architecture === 'x86_64' && manifest.platform.os === 'linux',
+    );
+    const arm64Manifest = keepManifests.find(
+      manifest => manifest.platform.architecture === 'aarch64' && manifest.platform.os === 'linux',
+    );
+
+    if (!amd64Manifest || !arm64Manifest) {
+      throw new Error('❌ Cannot find amd64 or arm64 manifest');
+    }
+
+    // now get the zstd entry from the arch manifest
+    const amd64ZstdManifest = await this.getManifest(
+      `https://quay.io/v2/podman/machine-os/manifests/${amd64Manifest.digest}`,
+    );
+    const arm64ZstdManifest = await this.getManifest(
+      `https://quay.io/v2/podman/machine-os/manifests/${arm64Manifest.digest}`,
+    );
+
+    // download the zstd layers
+    await this.downloadZstdFromManifest(
+      `${manifestUrl} for arm64`,
+      'podman-image-arm64.zst',
+      arm64ZstdManifest.layers[0],
+    );
+    await this.downloadZstdFromManifest(
+      `${manifestUrl} for amd64`,
+      'podman-image-x64.zst',
+      amd64ZstdManifest.layers[0],
+    );
   }
 }

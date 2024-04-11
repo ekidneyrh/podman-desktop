@@ -52,6 +52,7 @@ import { KubeGeneratorRegistry } from '/@/plugin/kube-generator-registry.js';
 import type { Menu } from '/@/plugin/menu-registry.js';
 import { MenuRegistry } from '/@/plugin/menu-registry.js';
 import { NavigationManager } from '/@/plugin/navigation/navigation-manager.js';
+import type { ExtensionBanner } from '/@/plugin/recommendations/recommendations-api.js';
 import { TaskManager } from '/@/plugin/task-manager.js';
 import { Updater } from '/@/plugin/updater.js';
 
@@ -141,6 +142,7 @@ import { KubernetesClient } from './kubernetes-client.js';
 import type { KubeContext } from './kubernetes-context.js';
 import type { ContextGeneralState, ResourceName } from './kubernetes-context-state.js';
 import { downloadGuideList } from './learning-center/learning-center.js';
+import { LibpodApiInit } from './libpod-api-enable/libpod-api-init.js';
 import type { MessageBoxOptions, MessageBoxReturnValue } from './message-box.js';
 import { MessageBox } from './message-box.js';
 import { NotificationRegistry } from './notification-registry.js';
@@ -165,6 +167,7 @@ import { getFreePort, getFreePortRange, isFreePort } from './util/port.js';
 import { ViewRegistry } from './view-registry.js';
 import { WebviewRegistry } from './webview/webview-registry.js';
 import { WelcomeInit } from './welcome/welcome-init.js';
+
 // workaround for ESM
 const checkDiskSpace: (path: string) => Promise<{ free: number }> = checkDiskSpacePkg as unknown as (
   path: string,
@@ -445,7 +448,12 @@ export class PluginSystem {
     const imageRegistry = new ImageRegistry(apiSender, telemetry, certificates, proxy);
     const viewRegistry = new ViewRegistry();
     const context = new Context(apiSender);
-    const containerProviderRegistry = new ContainerProviderRegistry(apiSender, imageRegistry, telemetry);
+    const containerProviderRegistry = new ContainerProviderRegistry(
+      apiSender,
+      configurationRegistry,
+      imageRegistry,
+      telemetry,
+    );
     const cancellationTokenRegistry = new CancellationTokenRegistry();
     const providerRegistry = new ProviderRegistry(apiSender, containerProviderRegistry, telemetry);
     const trayMenuRegistry = new TrayMenuRegistry(this.trayMenu, commandRegistry, providerRegistry, telemetry);
@@ -457,9 +465,6 @@ export class PluginSystem {
     await kubernetesClient.init();
     const closeBehaviorConfiguration = new CloseBehavior(configurationRegistry);
     await closeBehaviorConfiguration.init();
-
-    const recommendationsRegistry = new RecommendationsRegistry(configurationRegistry);
-    recommendationsRegistry.init();
 
     const messageBox = new MessageBox(apiSender);
 
@@ -566,6 +571,10 @@ export class PluginSystem {
     const welcomeInit = new WelcomeInit(configurationRegistry);
     welcomeInit.init();
 
+    // init libpod API configuration
+    const libpodApiInit = new LibpodApiInit(configurationRegistry);
+    libpodApiInit.init();
+
     const authentication = new AuthenticationImpl(apiSender);
 
     const cliToolRegistry = new CliToolRegistry(apiSender, exec, telemetry);
@@ -586,6 +595,7 @@ export class PluginSystem {
       apiSender,
       containerProviderRegistry,
       contributionManager,
+      providerRegistry,
       webviewRegistry,
     );
 
@@ -628,6 +638,10 @@ export class PluginSystem {
 
     const extensionsCatalog = new ExtensionsCatalog(certificates, proxy);
     const featured = new Featured(this.extensionLoader, extensionsCatalog);
+
+    const recommendationsRegistry = new RecommendationsRegistry(configurationRegistry, featured);
+    recommendationsRegistry.init();
+
     // do not wait
     featured.init().catch((e: unknown) => {
       console.error('Unable to initialized the featured extensions', e);
@@ -651,7 +665,7 @@ export class PluginSystem {
       return containerProviderRegistry.listSimpleContainers();
     });
     this.ipcHandle('container-provider-registry:listImages', async (): Promise<ImageInfo[]> => {
-      return containerProviderRegistry.listImages();
+      return containerProviderRegistry.podmanListImages();
     });
     this.ipcHandle('container-provider-registry:listPods', async (): Promise<PodInfo[]> => {
       return containerProviderRegistry.listPods();
@@ -1526,6 +1540,10 @@ export class PluginSystem {
 
     this.ipcHandle('featured:getFeaturedExtensions', async (): Promise<FeaturedExtension[]> => {
       return featured.getFeaturedExtensions();
+    });
+
+    this.ipcHandle('recommended:getExtensionBanners', async (): Promise<ExtensionBanner[]> => {
+      return recommendationsRegistry.getExtensionBanners();
     });
 
     this.ipcHandle('catalog:getExtensions', async (): Promise<CatalogExtension[]> => {

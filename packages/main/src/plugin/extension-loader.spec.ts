@@ -152,6 +152,7 @@ const containerProviderRegistry: ContainerProviderRegistry = {
   getContainerStats: vi.fn(),
   stopContainerStats: vi.fn(),
   listImages: vi.fn(),
+  podmanListImages: vi.fn(),
   listInfos: vi.fn(),
 } as unknown as ContainerProviderRegistry;
 
@@ -212,6 +213,7 @@ const navigationManager: NavigationManager = new NavigationManager(
   apiSender,
   containerProviderRegistry,
   contributionManager,
+  providerRegistry,
   webviewRegistry,
 );
 
@@ -1708,18 +1710,18 @@ describe('containerEngine', async () => {
   });
 
   test('listImages without option ', async () => {
-    vi.mocked(containerProviderRegistry.listImages).mockResolvedValue([]);
+    vi.mocked(containerProviderRegistry.podmanListImages).mockResolvedValue([]);
 
     const api = extensionLoader.createApi('/path', {});
     expect(api).toBeDefined();
 
     const images = await api.containerEngine.listImages();
     expect(images.length).toBe(0);
-    expect(containerProviderRegistry.listImages).toHaveBeenCalledWith(undefined);
+    expect(containerProviderRegistry.podmanListImages).toHaveBeenCalledWith(undefined);
   });
 
   test('listImages with provider option', async () => {
-    vi.mocked(containerProviderRegistry.listImages).mockResolvedValue([]);
+    vi.mocked(containerProviderRegistry.podmanListImages).mockResolvedValue([]);
 
     const api = extensionLoader.createApi('/path', {});
     expect(api).toBeDefined();
@@ -1730,7 +1732,7 @@ describe('containerEngine', async () => {
       } as unknown as containerDesktopAPI.ContainerProviderConnection,
     });
     expect(images.length).toBe(0);
-    expect(containerProviderRegistry.listImages).toHaveBeenCalledWith({
+    expect(containerProviderRegistry.podmanListImages).toHaveBeenCalledWith({
       provider: {
         name: 'dummyProvider',
       },
